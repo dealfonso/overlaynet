@@ -1,0 +1,223 @@
+#!/bin/bash
+source help
+source common
+source undo
+
+BR_ASSOCIATED=br-
+PREFIX=overnet-
+JSON=True
+MIN_VXLAN_RANGE=10
+MAX_VXLAN_RANGE=1024
+
+function _clean_ifacename() {
+    local IFACE_NAME="$1"
+    if [ "$IFACE_NAME" == "" ]; then
+        return
+    fi
+    INTERFACE=${INTERFACE::-1}
+    echo "${INTERFACE##$PREFIX}"
+}
+
+function get_vxlan_interfaces() {
+    local INTERFACES="$(ip link show | grep "[0-9]\\{1,\}: $PREFIX[^:]\\+:" | awk '{print $2}')"
+    local OUTPUT=
+    while read INTERFACE; do
+        OUTPUT="${OUTPUT}$(_clean_ifacename "$INTERFACE") "
+    done <<< "$INTERFACES"
+    echo -e "${OUTPUT}"
+}
+
+function get_br_interfaces() {
+    local BR_PREFIX="${BR_ASSOCIATED}${PREFIX}"
+    local INTERFACES="$(ip link show | grep "[0-9]\\{1,\}: $BR_PREFIX[^:]\\+:" | awk '{print $2}')"
+    local OUTPUT=
+    while read INTERFACE; do
+        OUTPUT="${OUTPUT}$(_clean_ifacename "$INTERFACE") "
+    done <<< "$INTERFACES"
+    echo -e "${OUTPUT}"
+}
+
+function get_interface() {
+    local INTERFACE="$(ip link show | grep "[0-9]\\{1,\}: $PREFIX$IFACE_NAME\\+:" | awk '{print $2}')"
+    echo "$(_clean_ifacename "$INTERFACE")"
+}
+
+function jsonize_interface() {
+    local INTERFACE_INFO="$1"
+    echo "{\"interface\":\"$INTERFACE_INFO\"}"
+}
+
+function list() {
+    local INFO="$1"
+    local OUTPUT=
+    while read INTERFACE; do
+        OUTPUT="$OUTPUT$(jsonize_interface $INTERFACE),"
+    done <<< "$(echo "$INFO"|tr ' ' '\n')"
+    echo "[${OUTPUT::-1}]"
+}
+
+function generate_id() {
+    local INTERFACES="$(get_vxlan_interfaces)"
+    for ((i=MIN_VXLAN_RANGE;i<MAX_VXLAN_RANGE;i++)); do
+        element_in_list "$i" "$INTERFACES" || break
+    done
+    if ((i<MAX_VXLAN_RANGE)); then
+        echo "$i"
+        return 0
+    else
+        echo "-1"
+        return 1
+    fi
+}
+
+function guess_physical_interface() {
+    p_warning "trying to guess the physical interface to use (using the first non 'lo' device in the 'ip' utility)"
+    local INTERFACES=$(ip link | grep '^[0-9]\{1,\}:' | grep -v ' lo:' | grep 'MULTICAST' | grep 'state UP' | awk '{print $2}' | head -n 1)
+    if [ "$INTERFACES" == "" ]; then
+        p_error "could not guess the physical interface"
+        return 1
+    fi
+    echo "${INTERFACES::-1}"
+    return 0
+}
+
+function create() {
+    local VXLAN_ID=
+    local PHYS_IFACE=
+    local IGMP_GROUP=239.1.1.1
+    _HELP__reset_help
+    _HELP__append_description "Creates one interface"
+    _HELP__add_help_cmd "[ ID ]" "identifier of the VLAN to create (blank to obtain a random ID)"
+    _HELP__add_help_cmd "--group|-g" "IGMP group to create the VXLAN (defaults to 239.1.1.1)"
+    _HELP__add_help_cmd "--device|-d" "physical device to use in the IGMP group (defaults to eth0)"
+    _HELP__add_help_cmd "--help|-h" "shows this help and exists"
+    
+    while (( $# > 0 )); do
+        case "$1" in
+        --help | -h) _HELP__usage create "$DESC" && exit 0;;
+        --device | -d) PHYS_IFACE="$2"
+            shift;;
+            *)  if [ "$VXLAN_ID" == "" ]; then 
+                    VXLAN_ID="$1"
+                else
+                    _HELP__usage create && exit 1
+                fi;;
+        esac
+        shift
+    done
+
+    if [ "$PHYS_IFACE" == "" ]; then
+        output_to_var_or_fail "PHYS_IFACE" "Could not guess the physical interface" guess_physical_interface || exit 1
+        p_debug "using physical interface $PHYS_IFACE"
+    fi
+
+    if [ "$VXLAN_ID" == "" ]; then
+        output_to_var_or_fail "VXLAN_ID" "Could not generate a new ID " generate_id || exit 1
+        p_debug "using VXLAN ID $VXLAN_ID"
+    fi
+
+echo """\
+    ip link add ${PREFIX}${VXLAN_ID} type vxlan id ${VXLAN_ID} group ${IGMP_GROUP} dstport 0 dev ${PHYS_IFACE}
+    _UNDO__add_undo_cmdline ip link delete ${PREFIX}${VXLAN_ID}
+    ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} type bridge
+    _UNDO__add_undo_cmdline ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
+    ip link set ${PREFIX}${VXLAN_ID} master ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
+    _UNDO__add_undo_cmdline ip link set ${PREFIX}${VXLAN_ID} nomaster
+    ip link set ${PREFIX}${VXLAN_ID} up
+    _UNDO__add_undo_cmdline ip link set ${PREFIX}${VXLAN_ID} down
+    ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} up
+    _UNDO__add_undo_cmdline ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} down
+"""
+    exit 0
+}
+
+function get() {
+    local IFACE_NAME=
+    _HELP__reset_help
+    _HELP__append_description "Gets the information about one interface"
+    _HELP__add_help_cmd "[ <interface name> ]" "name of the interface to get the information (blank to get all the interfaces)"
+    _HELP__add_help_cmd "--help|-h" "shows this help and exists"
+    
+    while (( $# > 0 )); do
+        case "$1" in
+        --help | -h) _HELP__usage get "$DESC" && exit 0;;
+            *)  if [ "$IFACE_NAME" == "" ]; then 
+                    IFACE_NAME="$1"
+                else
+                    _HELP__usage get && exit 1
+                fi;;
+        esac
+        shift
+    done
+
+    if [ "$IFACE_NAME" == "" ]; then
+        list "$(get_vxlan_interfaces)"
+    else
+        INTERFACE_INFO="$(get_interface "$IFACE_NAME")"
+        if [ "$INTERFACE_INFO" == "" ]; then
+            p_error "Not found"
+            exit 1
+        else
+            list "$INTERFACE_INFO"
+        fi
+    fi
+    exit 0
+}
+
+n=0
+while (( $# > 0 )); do
+    if [ "${1:0:1}" == "-" -a "${1:1:1}" != "-" ]; then
+        for f in $(echo "${1:1}" | sed 's/\(.\)/-\1 /g' ); do
+            ARR[$n]="$f"
+            n=$(($n+1))
+        done
+    else
+        ARR[$n]="$1"
+        n=$(($n+1))
+    fi
+    shift
+done
+
+UNDO=True
+VERBOSE=False
+QUIET=False
+_HELP__set_description "OverlayNET-BR - Helper to create Overlay Networks (Linux Bridges edition)"
+DESC="This is a tool that helps to create overlay networks using linux bridges"
+_HELP__add_help_cmd "--no-undo|-N" "does not try to undo the commands"
+_HELP__add_help_cmd "--help|-h" "shows this help and exits"
+_HELP__add_help_cmd "--verbose|-V" "display debug messages"
+_HELP__add_help_cmd "--quiet|-q" "supresses most of messages"
+_HELP__add_help_cmd "--prefix|-p" "the prefix of the interfaces for OverlayNET-BR"
+_HELP__add_help_cmd "get" "get the information of one or all the interfaces in the system (recognised by OverlayNET-BR; defaults 'nw-')"
+
+# Parse the commandline
+n=0
+COMMAND=
+while [ $n -lt ${#ARR[@]} -a "$COMMAND" == "" ]; do
+    PARAM="${ARR[$n]}"
+    case "$PARAM" in
+        get|create) COMMAND="$PARAM";;
+        --verbose | -V) VERBOSE=True;;
+        --no-undo | -N) UNDO=False;;
+        --quiet | -q) QUIET=True;;
+        --prefix | -p) 
+            n=$(($n+1))
+            PREFIX="${ARR[$n]}"
+            ;;
+        --help | -h) _HELP__usage "" "$DESC" && exit 0;;
+        *) _HELP__usage "" "$DESC" && exit 1;;
+    esac
+    n=$(($n+1))
+done
+
+# Finally execute the proper command
+if [ "$COMMAND" != "" ]; then
+    $COMMAND "${ARR[@]:$n}"
+    if [ $? -ne 0 ]; then
+        if [ "$UNDO" == "True" ]; then
+            _UNDO__execute
+        fi
+    fi
+else
+    echo "no command issued" && _HELP__usage "" && exit 1
+fi
