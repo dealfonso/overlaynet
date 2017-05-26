@@ -22,6 +22,7 @@
 declare CMD_CMD=()
 declare CMD_DESC=()
 _DESCRIPTION=
+_SUBDESCRIPTION=
 
 COLUMNS=$(tput cols 2> /dev/null)
 COLUMNS=${COLUMNS:-120}
@@ -47,6 +48,20 @@ function _HELP__append_description() {
 $@"
 }
 
+function _HELP__set_subdescription() {
+    _SUBDESCRIPTION="$@"
+}
+
+function _HELP__clear_subdescription() {
+    _SUBDESCRIPTION=
+}
+
+function _HELP__append_subdescription() {
+    _SUBDESCRIPTION="$_SUBDESCRIPTION
+
+$@"
+}
+
 function _HELP__usage() {
     # 
     # $ Usage: _HELP__usage <extra information> <long description>
@@ -55,6 +70,10 @@ function _HELP__usage() {
     if [ "$_DESCRIPTION" != "" ]; then
         echo
         echo "$_DESCRIPTION" | fold -s -w $_HELP__MAXWIDTH
+        echo
+    fi
+    if [ "$_SUBDESCRIPTION" != "" ]; then
+        echo "$_SUBDESCRIPTION" | fold -s -w $_HELP__MAXWIDTH
         echo
     fi
     if [ "$2" != "" ]; then

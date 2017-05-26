@@ -1,13 +1,24 @@
 #!/bin/bash
+
+# Some info: https://vincent.bernat.im/en/blog/2017-vxlan-linux
 source help
 source common
 source undo
+source tools
 
-BR_ASSOCIATED=br-
-PREFIX=overnet-
+SUDOCMD=sudo
+BR_ASSOCIATED=br
+PREFIX=vxo
 JSON=True
 MIN_VXLAN_RANGE=10
 MAX_VXLAN_RANGE=1024
+
+function ifacename_valid() {
+    if [[ "$1" =~ ^${PREFIX}.* ]]; then
+        return 0
+    fi
+    return 1
+}
 
 function _clean_ifacename() {
     local IFACE_NAME="$1"
@@ -25,35 +36,6 @@ function get_vxlan_interfaces() {
         OUTPUT="${OUTPUT}$(_clean_ifacename "$INTERFACE") "
     done <<< "$INTERFACES"
     echo -e "${OUTPUT}"
-}
-
-function get_br_interfaces() {
-    local BR_PREFIX="${BR_ASSOCIATED}${PREFIX}"
-    local INTERFACES="$(ip link show | grep "[0-9]\\{1,\}: $BR_PREFIX[^:]\\+:" | awk '{print $2}')"
-    local OUTPUT=
-    while read INTERFACE; do
-        OUTPUT="${OUTPUT}$(_clean_ifacename "$INTERFACE") "
-    done <<< "$INTERFACES"
-    echo -e "${OUTPUT}"
-}
-
-function get_interface() {
-    local INTERFACE="$(ip link show | grep "[0-9]\\{1,\}: $PREFIX$IFACE_NAME\\+:" | awk '{print $2}')"
-    echo "$(_clean_ifacename "$INTERFACE")"
-}
-
-function jsonize_interface() {
-    local INTERFACE_INFO="$1"
-    echo "{\"interface\":\"$INTERFACE_INFO\"}"
-}
-
-function list() {
-    local INFO="$1"
-    local OUTPUT=
-    while read INTERFACE; do
-        OUTPUT="$OUTPUT$(jsonize_interface $INTERFACE),"
-    done <<< "$(echo "$INFO"|tr ' ' '\n')"
-    echo "[${OUTPUT::-1}]"
 }
 
 function generate_id() {
@@ -116,20 +98,210 @@ function create() {
         p_debug "using VXLAN ID $VXLAN_ID"
     fi
 
-echo """\
-    ip link add ${PREFIX}${VXLAN_ID} type vxlan id ${VXLAN_ID} group ${IGMP_GROUP} dstport 0 dev ${PHYS_IFACE}
-    _UNDO__add_undo_cmdline ip link delete ${PREFIX}${VXLAN_ID}
-    ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} type bridge
-    _UNDO__add_undo_cmdline ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
-    ip link set ${PREFIX}${VXLAN_ID} master ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
-    _UNDO__add_undo_cmdline ip link set ${PREFIX}${VXLAN_ID} nomaster
-    ip link set ${PREFIX}${VXLAN_ID} up
-    _UNDO__add_undo_cmdline ip link set ${PREFIX}${VXLAN_ID} down
-    ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} up
-    _UNDO__add_undo_cmdline ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} down
-"""
+    $SUDOCMD ip link add ${PREFIX}${VXLAN_ID} type vxlan id ${VXLAN_ID} group ${IGMP_GROUP} dstport 0 dev ${PHYS_IFACE}
+    _UNDO__add_undo_cmdline $SUDOCMD ip link delete ${PREFIX}${VXLAN_ID}
+    $SUDOCMD ip link add ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} type bridge
+    _UNDO__add_undo_cmdline $SUDOCMD ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
+    $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} master ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
+    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} nomaster
+    $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} up
+    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} down
+    $SUDOCMD ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} up
+    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} down
     exit 0
 }
+
+function get_interface_info() {
+    local L
+    local IDX IFNAME IFID PREDICATE
+
+    local TYPE=link
+    local group dev id master="null" state
+    
+    while read L; do
+        if [[ "$L" =~ ^[0-9]*: ]]; then
+            IFS=':' read IDX IFNAME PREDICATE <<< "$L"
+            IFNAME="${IFNAME/ /}"
+            if ! ifacename_valid "$IFNAME"; then
+                return
+            fi
+            get_vars_from_list master state -- $PREDICATE
+            [ "$master" != "null" ] && master="\"$master\""
+            tolower state
+        else
+            read OP PREDICATE <<< "$L"
+            case "$OP" in
+                vxlan) get_vars_from_list id group dev -- $PREDICATE;;
+                bridge) TYPE=bridge;;
+                bridge_slave) TYPE=bridge_slave;;
+            esac
+        fi
+    done <<< "$1"
+
+    # Set the output (we pipe to remove the pretty chars)
+    { cat << EOF
+{
+    "interface": "$IFNAME",
+    "vxlan": {
+        "vni": "$id"
+    },
+    "driver": {
+        "type": "linuxbridges",
+        "group": "$group",
+        "device": "$dev",
+        "state": "$state",
+        "bridge": $master
+    }
+}
+EOF
+} 
+# | tr -d '\n\t '
+}
+
+function get_interfaces() {
+    local IFNAME="$1"
+
+    if [ "$IFNAME" != "" ]; then
+        if ! ifacename_valid "$IFNAME"; then
+            p_error "$IFNAME is not a valid name for an interface"
+            return 1
+        fi
+    fi
+
+    local IF_OUT
+    IF_OUT="$(ip -d link show $IFNAME 2> /dev/null)"
+    if [ $? -ne 0 ]; then
+        p_warning "could not get information about the interface/s $IFNAME"
+        return 1
+    fi
+    local IF_BUFFER=
+    local L=
+
+    local OUTPUT IFINFO
+    while read L; do
+        if [[ "$L" =~ ^[0-9]+: ]]; then
+            if [ "$IF_BUFFER" != "" ]; then
+                IFINFO=$(get_interface_info "$IF_BUFFER")
+                [ "$IFINFO" != "" ] && OUTPUT="$OUTPUT,$IFINFO"
+            fi
+            IF_BUFFER="$L"
+        else
+            IF_BUFFER="${IF_BUFFER}
+${L}"
+        fi
+    done <<< "$IF_OUT"
+    if [ "$IF_BUFFER" != "" ]; then
+        IFINFO=$(get_interface_info "$IF_BUFFER")
+        [ "$IFINFO" != "" ] && OUTPUT="$OUTPUT,$IFINFO"
+    fi
+    echo "[
+${OUTPUT:1}
+]" | tr -d ' \n\t'
+}
+
+function json_to_vars() {
+    local PREFIX="${1}_"
+    local JSON="$2"
+    local FIELDS="interface vxlan.vni driver.type driver.group driver.device driver.state driver.bridge"
+    local F V
+    for F in $FIELDS; do
+        V="${F/\./_}"
+        setonce "${PREFIX}${V}" "$(echo "$JSON" | jq -r ".[0].$F" 2> /dev/null)"
+    done
+}
+
+function check() {
+    local IFACE_NAME=
+    _HELP__reset_help
+    _HELP__append_description "Checks if one interface is properly built"
+    _HELP__add_help_cmd "<interface name>" "name of the interface to get the information (blank to get all the interfaces)"
+    _HELP__add_help_cmd "--help|-h" "shows this help and exists"
+    
+    while (( $# > 0 )); do
+        case "$1" in
+        --help | -h) _HELP__usage info "$DESC" && exit 0;;
+            *)  if [ "$IFACE_NAME" == "" ]; then 
+                    IFACE_NAME="$1"
+                else
+                    _HELP__usage info && exit 1
+                fi;;
+        esac
+        shift
+    done
+
+    if ! ifacename_valid "$IFACE_NAME"; then
+        p_error "$if1_name is not a valid name for an interface"
+        return 1
+    fi
+
+    local IFINFO
+    IFINFO=$(get_interfaces "${IFACE_NAME:? "the interface name is not provided" "$(_HELP__usage check)"}")
+    (($?!=0)) && exit 2
+    json_to_vars if1 "$IFINFO"
+
+    if [ "$if1_driver_type" != "linuxbridges" ]; then
+        p_error "type '$if1_driver_type' for the interface is not supported"
+        return 3
+    fi
+
+    if [ "$if1_driver_bridge" == "null" ]; then
+        p_error "the device has not any bridge"
+        return 4
+    fi
+
+    if ! isint "$if1_vxlan_vni"; then
+        p_error "the VNI is not valid"
+        return 5
+    fi
+
+    local state
+    get_vars_from_list state -- $(ip link show $if1_driver_bridge | head -n 1)
+    tolower state
+    if [ "$state" != "up" ]; then
+        p_error "the associated bridge $if1_driver_bridge is not up"
+        return 6
+    fi
+
+    p_debug "device is correct"
+    return 0
+}
+
+function delete() {
+    local IFACE_NAME=
+    _HELP__reset_help
+    _HELP__append_description "Deletes one interface along with its bridge"
+    _HELP__add_help_cmd "<interface name>" "name of the interface to get the information (blank to get all the interfaces)"
+    _HELP__add_help_cmd "--help|-h" "shows this help and exists"
+    
+    while (( $# > 0 )); do
+        case "$1" in
+        --help | -h) _HELP__usage info "$DESC" && exit 0;;
+            *)  if [ "$IFACE_NAME" == "" ]; then 
+                    IFACE_NAME="$1"
+                else
+                    _HELP__usage info && exit 1
+                fi;;
+        esac
+        shift
+    done
+
+    check "$IFACE_NAME"
+
+    # Here we have the information of the interfaces in if1_ vars
+    if [ $? -eq 0 ]; then
+        p_debug "deleting interface $IFACE_NAME"
+        $SUDOCMD ip link set $if1_driver_bridge down
+        $SUDOCMD ip link set $if1_interface down
+        $SUDOCMD ip link set $if1_interface nomaster
+        $SUDOCMD ip link delete $if1_driver_bridge
+        $SUDOCMD ip link delete $if1_interface
+    else
+        p_error "the device if not correct... please correct it or delete it by hand"
+    fi
+
+    return 0
+}
+
 
 function get() {
     local IFACE_NAME=
@@ -140,28 +312,18 @@ function get() {
     
     while (( $# > 0 )); do
         case "$1" in
-        --help | -h) _HELP__usage get "$DESC" && exit 0;;
+        --help | -h) _HELP__usage info "$DESC" && exit 0;;
             *)  if [ "$IFACE_NAME" == "" ]; then 
                     IFACE_NAME="$1"
                 else
-                    _HELP__usage get && exit 1
+                    _HELP__usage info && exit 1
                 fi;;
         esac
         shift
     done
 
-    if [ "$IFACE_NAME" == "" ]; then
-        list "$(get_vxlan_interfaces)"
-    else
-        INTERFACE_INFO="$(get_interface "$IFACE_NAME")"
-        if [ "$INTERFACE_INFO" == "" ]; then
-            p_error "Not found"
-            exit 1
-        else
-            list "$INTERFACE_INFO"
-        fi
-    fi
-    exit 0
+    get_interfaces "$IFACE_NAME"
+    exit $?
 }
 
 n=0
@@ -188,7 +350,7 @@ _HELP__add_help_cmd "--help|-h" "shows this help and exits"
 _HELP__add_help_cmd "--verbose|-V" "display debug messages"
 _HELP__add_help_cmd "--quiet|-q" "supresses most of messages"
 _HELP__add_help_cmd "--prefix|-p" "the prefix of the interfaces for OverlayNET-BR"
-_HELP__add_help_cmd "get" "get the information of one or all the interfaces in the system (recognised by OverlayNET-BR; defaults 'nw-')"
+_HELP__add_help_cmd "get" "get the information of one or all the interfaces in the system (recognised by OverlayNET-BR; defaults '$PREFIX')"
 
 # Parse the commandline
 n=0
@@ -196,7 +358,7 @@ COMMAND=
 while [ $n -lt ${#ARR[@]} -a "$COMMAND" == "" ]; do
     PARAM="${ARR[$n]}"
     case "$PARAM" in
-        get|create) COMMAND="$PARAM";;
+        get|create|check|delete) COMMAND="$PARAM";;
         --verbose | -V) VERBOSE=True;;
         --no-undo | -N) UNDO=False;;
         --quiet | -q) QUIET=True;;

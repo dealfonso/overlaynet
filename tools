@@ -1,0 +1,63 @@
+#!/bin/bash
+# http://wiki.bash-hackers.org/syntax/pe
+function ensure_boolean {
+    local V="$(echo ${!1} | tr '[A-Z]' [a-z])"
+    case "$V" in
+        true|1) V="true";;
+        *) V="false";;
+    esac
+    read $1 <<< "$V"
+}
+
+function isint {
+    local C="${1//[^0-9]/}"
+    if [ "$1" == "$C" ]; then
+        return 0
+    fi
+    return 1
+}
+
+function isfloat {
+    local C="${1/#*([0-9])\.+([0-9])/}"
+    if [ "$1" != "" -a "$C" == "" ]; then
+        return 0
+    fi
+    return 1
+}
+
+function tolower {
+    while [ $# -gt 0 ]; do
+        read $1 <<< "${!1,,}"
+        shift
+    done
+}
+
+function toupper {
+    while [ $# -gt 0 ]; do
+        read $1 <<< "${!1^^}"
+        shift
+    done
+}
+
+function setonce {
+    if [ "${!1}" == "" ]; then
+        read $1 <<< "$2"
+    fi
+}
+
+function get_vars_from_list {
+    local VAR_STR
+    while [ $# -gt 0 -a "$1" != "--" ]; do
+        VAR_STR="${VAR_STR}${1} "
+        shift
+    done
+    shift
+    while [ $# -gt 0 ]; do
+        if element_in_list "$1" "$VAR_STR"; then
+            V="$1"
+            shift
+            read "$V" <<< "$1"
+        fi
+        shift
+    done
+}
