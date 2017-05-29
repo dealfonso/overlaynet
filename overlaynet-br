@@ -63,57 +63,53 @@ function guess_physical_interface() {
     return 0
 }
 
-function create() {
-    local VXLAN_ID=
-    local PHYS_IFACE=
-    local IGMP_GROUP=239.1.1.1
-    _HELP__reset_help
-    _HELP__append_description "Creates one interface"
-    _HELP__add_help_cmd "[ ID ]" "identifier of the VLAN to create (blank to obtain a random ID)"
-    _HELP__add_help_cmd "--group|-g" "IGMP group to create the VXLAN (defaults to 239.1.1.1)"
-    _HELP__add_help_cmd "--device|-d" "physical device to use in the IGMP group (defaults to eth0)"
-    _HELP__add_help_cmd "--help|-h" "shows this help and exists"
-    
-    while (( $# > 0 )); do
-        case "$1" in
-        --help | -h) _HELP__usage create "$DESC" && exit 0;;
-        --device | -d) PHYS_IFACE="$2"
-            shift;;
-            *)  if [ "$VXLAN_ID" == "" ]; then 
-                    VXLAN_ID="$1"
-                else
-                    _HELP__usage create && exit 1
-                fi;;
-        esac
-        shift
+function json_to_vars() {
+    local PREFIX="${1}_"
+    local JSON="$2"
+    local FIELDS="interface vxlan.vni driver.type driver.group driver.device driver.state driver.bridge"
+    local F V
+    for F in $FIELDS; do
+        V="${F/\./_}"
+        setonce "${PREFIX}${V}" "$(echo "$JSON" | jq -r ".[0].$F" 2> /dev/null)"
     done
+}
 
-    if [ "$PHYS_IFACE" == "" ]; then
-        output_to_var_or_fail "PHYS_IFACE" "Could not guess the physical interface" guess_physical_interface || exit 1
-        p_debug "using physical interface $PHYS_IFACE"
-    fi
+function to_json() {
+    local if_interface="$1"
+    local if_vxlan="$2"
+    local if_driver_group="$3"
+    local if_driver_device="$4"
+    local if_driver_state="$5"
+    local if_driver_bridge="$6"
 
-    if [ "$VXLAN_ID" == "" ]; then
-        output_to_var_or_fail "VXLAN_ID" "Could not generate a new ID " generate_id || exit 1
-        p_debug "using VXLAN ID $VXLAN_ID"
-    fi
+    fix_json_null if_interface
+    fix_json_null if_vxlan
+    fix_json_null if_driver_group
+    fix_json_null if_driver_device
+    fix_json_null if_driver_state
+    fix_json_null if_driver_bridge
 
-    $SUDOCMD ip link add ${PREFIX}${VXLAN_ID} type vxlan id ${VXLAN_ID} group ${IGMP_GROUP} dstport 0 dev ${PHYS_IFACE}
-    _UNDO__add_undo_cmdline $SUDOCMD ip link delete ${PREFIX}${VXLAN_ID}
-    $SUDOCMD ip link add ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} type bridge
-    _UNDO__add_undo_cmdline $SUDOCMD ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
-    $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} master ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
-    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} nomaster
-    $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} up
-    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} down
-    $SUDOCMD ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} up
-    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} down
-    exit 0
+    { cat << EOF
+{
+    "interface": $if_interface,
+    "vxlan": {
+        "vni": $if_vxlan
+    },
+    "driver": {
+        "type": "linuxbridges",
+        "group": $if_driver_group,
+        "device": $if_driver_device,
+        "state": $if_driver_state,
+        "bridge": $if_driver_bridge
+    }
+}
+EOF
+} 
 }
 
 function get_interface_info() {
     local L
-    local IDX IFNAME IFID PREDICATE
+    local IDX IFNAME IFID PREDICATE OP
 
     local TYPE=link
     local group dev id master="null" state
@@ -158,6 +154,46 @@ EOF
 # | tr -d '\n\t '
 }
 
+function search_vni() {
+    local VNI="$1"
+
+    if ! isint "$VNI"; then
+        p_error "'$VNI' is not a valid ID for any VXLAN"
+        return 1
+    fi
+
+    local IPOUT="$(ip -d link show)"
+    local L
+    local IDX IFNAME PREDICATE OP
+    local group dev id
+    
+    while read L; do
+        if [[ "$L" =~ ^[0-9]*: ]]; then
+            IFS=':' read IDX IFNAME PREDICATE <<< "$L"
+            IFNAME="${IFNAME/ /}"
+            if ! ifacename_valid "$IFNAME"; then
+                IFNAME=""
+            fi
+        else
+            if [ "$IFNAME" != "" ]; then
+                read OP PREDICATE <<< "$L"
+                case "$OP" in
+                    vxlan) get_vars_from_list id group dev -- $PREDICATE
+                        if [ "$id" == "$VNI" ]; then
+                                break;
+                        fi;;
+                esac
+            fi
+        fi
+    done <<< "$IPOUT"
+    if [ "$IFNAME" != "" ]; then
+        echo "$IFNAME"
+        return 0
+    else
+        return 1
+    fi
+}
+
 function get_interfaces() {
     local IFNAME="$1"
 
@@ -199,15 +235,75 @@ ${OUTPUT:1}
 ]" | tr -d ' \n\t'
 }
 
-function json_to_vars() {
-    local PREFIX="${1}_"
-    local JSON="$2"
-    local FIELDS="interface vxlan.vni driver.type driver.group driver.device driver.state driver.bridge"
-    local F V
-    for F in $FIELDS; do
-        V="${F/\./_}"
-        setonce "${PREFIX}${V}" "$(echo "$JSON" | jq -r ".[0].$F" 2> /dev/null)"
+function create() {
+    local VXLAN_ID=
+    local PHYS_IFACE=
+    local IGMP_GROUP=239.1.1.1
+    _HELP__reset_help
+    _HELP__append_description "Creates one interface"
+    _HELP__add_help_cmd "[ ID ]" "identifier of the VLAN to create (blank to obtain a random ID)"
+    _HELP__add_help_cmd "--group|-g" "IGMP group to create the VXLAN (defaults to 239.1.1.1)"
+    _HELP__add_help_cmd "--device|-d" "physical device to use in the IGMP group (defaults to eth0)"
+    _HELP__add_help_cmd "--help|-h" "shows this help and exists"
+    
+    while (( $# > 0 )); do
+        case "$1" in
+        --help | -h) _HELP__usage create "$DESC" && exit 0;;
+        --device | -d) PHYS_IFACE="$2"
+            shift;;
+            *)  if [ "$VXLAN_ID" == "" ]; then 
+                    VXLAN_ID="$1"
+                else
+                    _HELP__usage create && exit 1
+                fi;;
+        esac
+        shift
     done
+
+    if [ "$PHYS_IFACE" == "" ]; then
+        output_to_var_or_fail "PHYS_IFACE" "Could not guess the physical interface" guess_physical_interface || exit 1
+        p_debug "using physical interface $PHYS_IFACE"
+    fi
+
+    if [ "$VXLAN_ID" == "" ]; then
+        output_to_var_or_fail "VXLAN_ID" "Could not generate a new ID " generate_id || exit 1
+        p_debug "using VXLAN ID $VXLAN_ID"
+    fi
+
+    local OUTPUT
+    exec_or_fail "could not create the device ${PREFIX}${VXLAN_ID}" \
+        $SUDOCMD ip link add ${PREFIX}${VXLAN_ID} type vxlan id ${VXLAN_ID} group ${IGMP_GROUP} dstport 0 dev ${PHYS_IFACE} \
+        || return 1
+
+    _UNDO__add_undo_cmdline $SUDOCMD ip link delete ${PREFIX}${VXLAN_ID}
+
+    exec_or_fail "could not create the bridge ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}" \
+        $SUDOCMD ip link add ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} type bridge \
+        || return 2
+
+    _UNDO__add_undo_cmdline $SUDOCMD ip link delete ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}
+
+    exec_or_fail "could not enslave the vlxan interface to the bridge" \
+        $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} master ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} \
+        || return 3
+
+    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} nomaster
+
+    exec_or_fail "could not get interface ${PREFIX}${VXLAN_ID} up" \
+        $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} up \
+        || return 4
+
+    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${PREFIX}${VXLAN_ID} down
+
+    exec_or_fail "could not get interface ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} up" \
+        $SUDOCMD ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} up \
+        || return 5
+
+    _UNDO__add_undo_cmdline $SUDOCMD ip link set ${BR_ASSOCIATED}${PREFIX}${VXLAN_ID} down
+
+    to_json "${PREFIX}${VXLAN_ID}" "${VXLAN_ID}" "${IGMP_GROUP}" "${PHYS_IFACE}" "null" "${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}"
+    # echo "${BR_ASSOCIATED}${PREFIX}${VXLAN_ID}"
+    return 0
 }
 
 function check() {
@@ -302,17 +398,19 @@ function delete() {
     return 0
 }
 
-
 function get() {
     local IFACE_NAME=
+    local ISVNI=False
     _HELP__reset_help
     _HELP__append_description "Gets the information about one interface"
-    _HELP__add_help_cmd "[ <interface name> ]" "name of the interface to get the information (blank to get all the interfaces)"
+    _HELP__add_help_cmd "[ <bridge name> | <vni> ]" "name of the bridge or identifier of the VXLAN to get the information (blank to get all the interfaces)"
+    _HELP__add_help_cmd "--vni|-v" "the parameter is a Virtual Network Indentifier"
     _HELP__add_help_cmd "--help|-h" "shows this help and exists"
     
     while (( $# > 0 )); do
         case "$1" in
         --help | -h) _HELP__usage info "$DESC" && exit 0;;
+        --vni | -v) ISVNI=True;;
             *)  if [ "$IFACE_NAME" == "" ]; then 
                     IFACE_NAME="$1"
                 else
@@ -322,8 +420,15 @@ function get() {
         shift
     done
 
+    if [ "$ISVNI" == "True" ]; then
+        IFACE_NAME=$(search_vni "$IFACE_NAME")
+        if [ $? -ne 0 ]; then
+            p_error "could not find any device for that VNI"
+            return 1
+        fi
+    fi
     get_interfaces "$IFACE_NAME"
-    exit $?
+    return $?
 }
 
 n=0
@@ -373,9 +478,11 @@ while [ $n -lt ${#ARR[@]} -a "$COMMAND" == "" ]; do
 done
 
 # Finally execute the proper command
+RETVAL=0
 if [ "$COMMAND" != "" ]; then
     $COMMAND "${ARR[@]:$n}"
-    if [ $? -ne 0 ]; then
+    RETVAL=$?
+    if [ $RETVAL -ne 0 ]; then
         if [ "$UNDO" == "True" ]; then
             _UNDO__execute
         fi
@@ -383,3 +490,4 @@ if [ "$COMMAND" != "" ]; then
 else
     echo "no command issued" && _HELP__usage "" && exit 1
 fi
+exit $RETVAL

@@ -9,7 +9,19 @@ function ensure_boolean {
     read $1 <<< "$V"
 }
 
+function fix_json_null {
+    local V="$(echo ${!1} | tr '[A-Z]' [a-z])"
+    case "$V" in
+        null) ;;
+        *) V="\"$V\"";;
+    esac
+    read $1 <<< "$V"
+}
+
 function isint {
+    if [ "$1" == "" ]; then
+        return 1
+    fi
     local C="${1//[^0-9]/}"
     if [ "$1" == "$C" ]; then
         return 0
